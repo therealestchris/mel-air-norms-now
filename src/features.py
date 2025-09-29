@@ -10,6 +10,10 @@ PROCESSED = config.PROCESSED
 # accept a daily value only if we have at least this many valid hours that day
 MIN_VALID_HOURS = 18
 
+# Baseline windows for "norms" (override via CLI later if desired)
+DEFAULT_BASELINE_START = getattr(config, "BASELINE_START", "2021-12-31")
+DEFAULT_BASELINE_END = getattr(config, "BASELINE_END", "2023-12-31")
+
 # WHO daily guideline thresholds (ug/m3)
 WHO_PM25_DAILY = 15.0
 WHO_PM10_DAILY = 45.0
@@ -17,6 +21,50 @@ WHO_PM10_DAILY = 45.0
 def _require(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"{path} not found. Did you run `python main.py --step clean`?")
+    
+def _auto_select_baseline_window(daily: pd.DataFrame,
+                                 req_start: str,
+                                 req_end: str) -> tuple[str, str]:
+    """
+    If the requested baseline window has 0 rows, or if it overlaps only the
+    most recent year, (same_year problem), choose a sensible multi-year past
+    window from whatever years are available before the latest year
+    """
+
+    # ensure 'date' is datetime (robust if caller forgot)  #
+    if not pd.api.types.is_datetime64_any_dtype(daily["date"]):         
+        daily = daily.copy()                                            
+        daily["date"] = pd.to_datetime(daily["date"])                   
+
+    ds = pd.to_datetime(daily["date"].min())
+    de = pd.to_datetime(daily["date"].max())
+    req_s, req_e = pd.to_datetime(req_start), pd.to_datetime(req_end)
+
+    # requested baseline rows
+    base = daily[(daily["date"] >= req_s) & (daily["date"] <= req_e)]
+    if len(base) > 0:
+        # if the requested window equals the most recent year only, warn
+        years = base["date"].dt.year.unique()
+        if len(years) == 1 and years[0] == de.year:
+            utils.log(f"[features] Baseline only covers current year {de.year}; "
+                      f"auto-selecting older years.")
+        else:
+            return req_start, req_end # keep user window
+        
+    # build an automatic window: use up to 4 years before most recent year
+    avail_years = sorted(daily["date"].dt.year.unique())
+    latest = de.year
+    older = [y for y in avail_years if y < latest]
+    if not older:
+        utils.log("[features] No older years available for baseline; norms will be NaN.")
+        return req_start, req_end
+    
+    # take the last up to 4 older years
+    chosen = older[-4:]
+    auto_start = pd.Timestamp(f"{min(chosen)}-01-01").strftime("%Y-%m-%d")
+    auto_end = pd.Timestamp(f"{max(chosen)}-12-31").strftime("%Y-%m-%d")
+    utils.log(f"[features] Auto baseline: {auto_start}..{auto_end} from available years {chosen}")
+    return auto_start, auto_end
     
 def _load_hourly() -> pd.DataFrame:
     """Load the tidy hourly table produced by clean.py"""
@@ -68,31 +116,14 @@ def _add_rollings(daily: pd.DataFrame) -> pd.DataFrame:
     Uses groupby-apply for clarity; efficient enough for typical sizes.
     """
 
-    # this function takes one group of data (e.g., all PM2.5 readings at site A).
-    def add_roll(g: pd.DataFrame) -> pd.DataFrame:
-        # ensures rows are in chronological order.
-        # set_index makes the date column the index.
-        g = g.sort_values("date").set_index("date")
+    out = daily.sort_values(["site_id", "pollutant", "date"]).copy()
 
-        # 7-day sliding window; at the start of the series, it allows fewer days (min_periods = 1)
-        # so you still get a value.
-        g["roll7"] = g["daily_median"].rolling(7, min_periods=1).median()
+    # rolling by group on the daily_median series
+    grp = out.groupby(["site_id", "pollutant"])["daily_median"]
 
-        # 30-day sliding window, but requires at least 7 days of data before producing a result.
-        g["roll30"] = g["daily_median"].rolling(30, min_periods=7).median()
+    out["roll7"] = grp.transform(lambda s: s.rolling(7, min_periods=1).median())
+    out["roll30"] = grp.transform(lambda s: s.rolling(30, min_periods=7).median())
 
-        # reset_index puts date back as a normal column for consistency.    
-        return g.reset_index()
-    
-    out = (daily
-           # groupby splits the dataset into sub-tables: one-per-site x pollutant.
-           # this is because we don't want PM10 from site A mixing with PM10 from site B when 
-           # rolling; each group must be independent. 
-           # group_keys = False prevents pandas from adding an extra index level with the group labels.
-           # (so there are no multi-indices)
-           .groupby(["site_id", "pollutant"], group_keys = False)
-            # apply add_roll applies the helper function to each group, to do the rolling features.
-           .apply(add_roll))
     return out
 
 # returns another series where each element is a string key like "01-15" for Jan 15.
@@ -198,4 +229,54 @@ def _join_norms_and_compute(daily: pd.DataFrame,
     # Clean up, using the 3 natural indexing keys for final daily time series.
     return out.sort_values(["site_id","pollutant","date"])
 
-# final part to complete: building the build_all function
+# after this part, we create the public entry point; which is the place in the program where the
+# execution begins.
+def build_all(base_start: str = DEFAULT_BASELINE_START,
+              base_end:   str = DEFAULT_BASELINE_END) -> None:
+    """
+    Orchestrate feature building:
+    1) hourly -> daily
+    2) rolling windows -> 
+    3) baseline climatology
+    4) join + deltas / z / exceedance
+    5) write outputs
+    """
+    # from config.py; ensure all directories exist, and create folders if missing
+    config.ensure_dirs()
+    utils.log("[features] Loading hourly tidy data...")
+    hourly = _load_hourly()
+    # {len(hourly):,} means: "format the integer with thousands seperators."
+    # e.g., len(hourly) == 1234567 → prints 1,234,567.
+    utils.log(f"[features] Read hourly rows: {len(hourly):,}")
+
+    # converts hourly rows into daily metrics per (site, pollutant): median/mean and
+    # valid_hours (then filters by MIN_VALID_HOURS)
+    utils.log("[features] Aggregating hourly -> daily...")
+    daily = _to_daily(hourly)
+
+    utils.log("[features] Adding rolling medians (7d, 30d)...")
+    daily = _add_rollings(daily)
+    daily_path = PROCESSED / "daily.parquet"
+    daily.to_parquet(daily_path, index=False)
+    utils.log(f"[features] Wrote daily -> {daily_path} ({len(daily):,} rows)")
+
+    auto_start, auto_end = _auto_select_baseline_window(daily, base_start, base_end)
+    utils.log(f"[features] Building baseline climatology {auto_start}..{auto_end}")
+    clim = _build_climatology(daily, auto_start, auto_end)
+    clim_path = PROCESSED / f"climatology_{auto_start}_{auto_end}.parquet"
+    clim.to_parquet(clim_path, index=False)
+    utils.log(f"[features] Wrote climatology -> {clim_path} ({len(clim):,} rows)")
+
+    utils.log("[features] Joining norms and computing deltas/z/exceedance...")
+    joined = _join_norms_and_compute(daily, clim)
+    joined_path = PROCESSED / "daily_with_norms.parquet"
+    joined.to_parquet(joined_path, index = False)
+    utils.log(f"[features] Wrote joined daily -> {joined_path} ({len(joined):,} rows)")
+
+    # Quick hints if norms are missing
+    # joined["norm_median"].isna() returns a Boolean series: True when the norm is missing.
+    # .mean() on booleans treats True=1, False=0, so you get the fraction of missing norms.
+    missing_norms = joined["norm_median"].isna().mean()
+    if missing_norms > 0:
+        utils.log(f"[features] NOTE: {missing_norms:.1%} of days lacked norms "
+                  f"(outside baseline window or sparse baseline). Consider adjusting baseline. ")

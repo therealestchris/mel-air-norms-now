@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import pandas as pd
+import re
 from zoneinfo import ZoneInfo
 from . import config, utils
 
@@ -43,6 +44,81 @@ USECOLS_READ = [
 # how many rows you’ll show in debug logs (e.g., df.head(DEBUG_SAMPLE_MAX)).
 DEBUG_SAMPLE_MAX = 5  
 
+def _norm(s: str) -> str:
+    """
+    normalize a column name for fuzzy matching
+    """
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+# for each canonical field, list acceptable header spellings (normalised)
+ALIAS = {
+    "datetime_local": {
+        "datetimelocal","datetimeaedt","localdatetime","localdate","localtime",
+        "datetimelocal(aest)","datetime_local","datetimeaest","date_time_local"
+    },
+    "datetime_aest": {
+        "datetimeaest","datetimelocal(aest)","datetime_aest","aesttime"
+    },
+    "location_id": {
+        "locationid","siteid","stationid","locationcode","site_id"
+    },
+    "location_name": {
+        "locationname","sitename","stationname","site_name","station"
+    },
+    "parameter_name": {
+        "parametername","parameter","pollutant","pollutantname"
+    },
+    "unit_of_measure": {
+        "unitofmeasure","unit","units","uom"
+    },
+    "value": {
+        "value","concentration","reading","measurement"
+    },
+    "validation_flag": {
+        "validationflag","validity","qaflag","flag"
+    },
+}
+
+def _build_rename_map(df_cols: list[str]) -> dict:
+    """
+    return rename map from raw -> canonical using aliases
+    """
+    norm_to_raw = {_norm(c): c for c in df_cols}
+    rename = {}
+    def pick(key: str):
+        for alias in ALIAS[key]:
+            if alias in norm_to_raw:
+                return norm_to_raw[alias]
+        return None
+    
+    candidates = {
+        "datetime_local": pick("datetime_local"),
+        "datetime_AEST":  pick("datetime_aest"),
+        "location_id":    pick("location_id"),
+        "location_name":  pick("location_name"),
+        "parameter_name": pick("parameter_name"),
+        "unit_of_measure":pick("unit_of_measure"),
+        "value":          pick("value"),
+        "validation_flag":pick("validation_flag"),
+    }
+    # Build raw→canonical map (only for found columns)
+    colmap = {
+        "datetime_local":  "timestamp_local",
+        "datetime_AEST":   "timestamp_aest",
+        "location_id":     "site_id",
+        "location_name":   "site_name",
+        "parameter_name":  "pollutant",
+        "unit_of_measure": "unit",
+        "value":           "value",
+        "validation_flag": "validation_flag",
+    }
+    for raw_key, canon in colmap.items():
+        raw_col = candidates.get(raw_key)
+        if raw_col:
+            rename[raw_col] = canon
+    return rename
+
+
 # the "_" in the function name just signifies that it is an internal function.
 # Tries to read a file at path into a pandas DataFrame.
 # If it’s an Excel file (.xlsx/.xls), it first tries to read the 
@@ -51,42 +127,59 @@ DEBUG_SAMPLE_MAX = 5
 # at a tiny sample of each sheet’s header and picking the one with the biggest column overlap.
 # if it’s not Excel, it falls back to CSV (pd.read_csv).
 def _read_any(path: Path) -> pd.DataFrame:
-    """Read from the correct sheet; fall back to auto-detection."""
+    """Robust Excel reader: scan sheets & header rows, fuzzy-match columns, then read once."""
     if path.suffix.lower() in (".xlsx", ".xls"):
         try:
             # loads data from an excel file into a pandas DataFrame.
             # openpyxl is a python package that can read/write .xlsx files.
-            df = pd.read_excel(path, sheet_name="AllData", usecols=USECOLS_READ, engine="openpyxl")
+            df = pd.read_excel(path, sheet_name="AllData", engine="openpyxl")
 
             # utils.log is your project’s logging helper (defined in your utils module).
             # it likely prints a timestamped / prefixed message to stdout or to a log file.
-            utils.log(f"[clean] Loaded sheet=AllData rows={len(df):,} cols={list(df.columns)}")  
+            utils.log(f"[clean] Loaded sheet=AllData rows={len(df):,} cols={list(map(str, df.columns))}")
             return df
-        
         except Exception as e:
-            utils.log(f"[clean] Could not read 'AllData' directly ({e}); scanning sheets…")  
-            sheets = pd.read_excel(path, sheet_name=None, nrows=2, engine="openpyxl")
-            wanted = set(USECOLS_READ)
-            best_name, best_overlap = None, -1
+            utils.log(f"[clean] No 'AllData' sheet ({e}); scanning all sheets…") 
 
-            for name, head in sheets.items():
+        # scan all sheets & try multiple header rows for best match
+        xl = pd.ExcelFile(path, engine="openpyxl")  
+        best = None                                  
+        best_score = -1                              
+        best_info = None                             
+
+        # Union of all alias tokens (normalized)
+        alias_union = set().union(*ALIAS.values())   
+
+        for sheet in xl.sheet_names:                 
+            # try first 5 rows as header
+            for header_row in range(0, 5):       
+                try:
+                    head = xl.parse(sheet, nrows=1, header=header_row)
+                except Exception:
+                    continue
                 # map(str, head.columns) applies str(...) to each column name, ensuring everything is a plain string
-                cols = set(map(str, head.columns))
-                overlap = len(wanted & cols)
-                if overlap > best_overlap:
-                    best_name, best_overlap = name, overlap
+                raw_cols = list(map(str, head.columns))
+                norm_cols = {_norm(c) for c in raw_cols}
+                # score = how many of our alias tokens appear in this header
+                score = len(norm_cols & alias_union)
+                if score > best_score:
+                    best_score = score
+                    best = (sheet, header_row, raw_cols)
+        # require at least 4 useful cols
+        if best is None or best_score < 4:         
+            raise ValueError("Could not find a sheet+header with expected columns. Please check the file.")
 
-            if best_name is None or best_overlap < 4:
-                raise ValueError("Could not find a sheet with expected columns. Please check the file.")
-            
-            utils.log(f"[clean] Auto-selected sheet: {best_name} (overlap={best_overlap})")
-            df = pd.read_excel(path, sheet_name=best_name, usecols=USECOLS_READ, engine="openpyxl")
-            utils.log(f"[clean] Loaded sheet={best_name} rows={len(df):,} cols={list(df.columns)}")  
-            return df
-        
+        sheet, header_row, raw_cols = best
+        utils.log(f"[clean] Auto-selected sheet='{sheet}' header_row={header_row} (score={best_score})")  
+
+        # read full sheet once (no usecols), then we’ll rename+select downstream
+        df = xl.parse(sheet, header=header_row)      
+        utils.log(f"[clean] Loaded sheet={sheet} rows={len(df):,} cols={list(map(str, df.columns))}")  
+        return df
+
     # CSV fallback
     df = pd.read_csv(path)
-    utils.log(f"[clean] Loaded CSV rows={len(df):,} cols={list(df.columns)}")  
+    utils.log(f"[clean] Loaded CSV rows={len(df):,} cols={list(map(str, df.columns))}")
     return df
 
 # function that parses whatever time columns exist, and makes sure they are timezone-aware,
@@ -191,7 +284,7 @@ def run() -> None:
     paths = sorted(RAW.glob("*.xlsx")) + sorted(RAW.glob("*.csv"))
     if not paths:
         utils.log(f"[clean] No raw files in {RAW}. Put your file(s) there and rerun.")
-        return
+        return 
 
     frames = []
     for p in paths:
@@ -201,9 +294,9 @@ def run() -> None:
 
         # Rename vendor columns to schema where present
         df.columns = [c.strip() for c in df.columns]
-        rename = {k: v for k, v in COLMAP.items() if k in df.columns}
+        rename = _build_rename_map(list(df.columns))
         df = df.rename(columns=rename)
-        utils.log(f"[clean] Renamed cols present: {list(rename.values())}") 
+        utils.log(f"[clean] Renamed → {rename}")  # helpful debug
 
         # Keep a consistent subset if columns exist
         keep_candidates = ["timestamp_local", "timestamp_aest", "site_id", "site_name",

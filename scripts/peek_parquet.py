@@ -1,8 +1,8 @@
-# scripts/peek_parquet.py
+# for peeking in the first 10 lines in the parquet.
 import pandas as pd
 from pathlib import Path
 
-DF_PATH = Path("data/interim/hourly_uniform.parquet")
+DF_PATH = Path("data/interim/daily.parquet")
 
 def main():
     if not DF_PATH.exists():
