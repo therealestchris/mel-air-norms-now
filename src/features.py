@@ -11,7 +11,7 @@ PROCESSED = config.PROCESSED
 MIN_VALID_HOURS = 18
 
 # Baseline windows for "norms" (override via CLI later if desired)
-DEFAULT_BASELINE_START = getattr(config, "BASELINE_START", "2021-12-31")
+DEFAULT_BASELINE_START = getattr(config, "BASELINE_START", "2019-01-01")
 DEFAULT_BASELINE_END = getattr(config, "BASELINE_END", "2023-12-31")
 
 # WHO daily guideline thresholds (ug/m3)

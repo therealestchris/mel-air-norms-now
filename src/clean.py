@@ -9,6 +9,19 @@ RAW = config.RAW
 INTERIM = config.INTERIM
 LOCAL_TZ = ZoneInfo("Australia/Melbourne")
 
+# defaults for units when a year/sheet doesn't carry units
+POLLUTANT_DEFAULT_UNIT = {
+    "PM2.5": "ug/m3",
+    "PM10":  "ug/m3",
+    "BPM2.5": "ug/m3",
+    "BSP":   "1/Mm",
+    "NO2":   "ppb",
+    "O3":    "ppb",
+    "SO2":   "ppb",
+    "CO" :   "ppm",
+    "DBT":   "degC",
+}
+
 # Exact mapping based on your file's headers (AllData sheet)
 COLMAP = {
     "datetime_local":  "timestamp_local",
@@ -118,6 +131,76 @@ def _build_rename_map(df_cols: list[str]) -> dict:
             rename[raw_col] = canon
     return rename
 
+def _reshape_2019_2020(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    2019-20 files are already long; hence we will map to 
+    canonical columns and pick pollutant label in robust order
+    """
+
+    # choose pollutant label: param_short_name (best) -> param_id -> param_name
+    if "param_short_name" in df:
+        pol = df["param_short_name"].astype(str)
+    elif "param_id" in df:
+        pol = df["param_id"].astype(str)
+    else:
+        pol = df["param_name"].astype(str)
+    
+    out = pd.DataFrame({
+        "timestamp_local": df["sample_datetime"],
+        "site_id": df["sample_point_id"],
+        "site_name": df["sp_name"],
+        "pollutant": pol,
+        "unit": df.get("param_std_unit_of_measure", pd.Series(index=df.index, dtype=object)),
+        "value": df["value"],
+        "validation_flag": df.get("validation_flag", pd.Series(index=df.index, dtype=object)),
+    })
+    return out
+
+def _reshape_2021_wide(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    2021 files: one sheet per site, wide format.
+    Melt pollutant columns to long and attach default units if missing.
+    """
+
+    # Guard: if the frame already looks long, do not melt.
+    low = {c.lower() for c in df.columns}
+    if {"parameter_name", "value"} <= low:
+        return df.copy()
+
+    id_vars = [c for c in ["datetime_local","datetime_AEST","location_id","location_name"] if c in df.columns]
+
+    # exclude known non-pollutant columns from value_vars explicitly
+    exclude = set(id_vars) | {
+        "unit_of_measure", "parameter_name", "value", "validation_flag"
+    }
+
+    value_vars = [c for c in df.columns if c not in id_vars]
+
+    long = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="pollutant", value_name="value")
+
+    long = long.rename(columns={
+        "location_id": "site_id",
+        "location_name": "site_name",
+    })
+
+    # prefer datetime_local if present; else use datetime_AEST as local
+    if "datetime_local" in long:
+        long["timestamp_local"] = long["datetime_local"]
+    else:
+        long["timestamp_local"] = long["datetime_AEST"]
+
+    # set unit from defaults (unit not present in 2021 wide sheets)
+    pol_clean = long["pollutant"].astype(str).str.upper().str.replace(" ", "", regex=False)
+    long["unit"] = pol_clean.map(POLLUTANT_DEFAULT_UNIT).astype(object)
+
+    # finalize columns
+    long = long.rename(columns={"reading": "value"})
+    keep = ["timestamp_local", "site_id", "site_name", "pollutant", "unit", "value"]
+    if "validation_flag" in long.columns:
+        keep.append("validation_flag")
+    out = long[keep].copy()
+
+    return out
 
 # the "_" in the function name just signifies that it is an internal function.
 # Tries to read a file at path into a pandas DataFrame.
@@ -143,12 +226,18 @@ def _read_any(path: Path) -> pd.DataFrame:
 
         # scan all sheets & try multiple header rows for best match
         xl = pd.ExcelFile(path, engine="openpyxl")  
-        best = None                                  
-        best_score = -1                              
-        best_info = None                             
 
-        # Union of all alias tokens (normalized)
-        alias_union = set().union(*ALIAS.values())   
+        def normset(cols):
+            return {_norm(c) for c in map(str, cols)}
+        
+        # key signatures (normalized) for sigma detection
+        SIG_1920_BASE = {_norm("sample_point_id"), _norm("sp_name"), _norm("sample_datetime"), _norm("value")}
+        SIG_1920_EITHER = [{_norm("param_short_name")}, {_norm("param_id")}, {_norm("param_name")}]
+        SIG_2021_BASE = {_norm("location_id"), _norm("location_name")}
+        SIG_LOCAL = {_norm("datetime_local"), _norm("datetime_aest")}
+
+        best = None                                  
+        best_score = -1                                                
 
         for sheet in xl.sheet_names:                 
             # try first 5 rows as header
@@ -157,20 +246,31 @@ def _read_any(path: Path) -> pd.DataFrame:
                     head = xl.parse(sheet, nrows=1, header=header_row)
                 except Exception:
                     continue
-                # map(str, head.columns) applies str(...) to each column name, ensuring everything is a plain string
-                raw_cols = list(map(str, head.columns))
-                norm_cols = {_norm(c) for c in raw_cols}
-                # score = how many of our alias tokens appear in this header
-                score = len(norm_cols & alias_union)
+                nset = normset(head.columns)
+
+                # HARD DETECT: 2019/20 long schema
+                if SIG_1920_BASE.issubset(nset) and any(s.issubset(nset) for s in SIG_1920_EITHER):
+                    utils.log(f"[clean] Detected 2019/2020 schema in sheet='{sheet}' header_row={header_row}")
+                    return xl.parse(sheet, header=header_row)
+                
+                # HARD DETECT: 2021 wide schema
+                if SIG_2021_BASE.issubset(nset) and (len(SIG_LOCAL & nset) > 0):
+                    utils.log(f"[clean] Detected 2021 wide schema in sheet='{sheet}' header_row={header_row}")
+                    return xl.parse(sheet, header=header_row)
+                
+                # Soft score fallback with ALIAS union
+                alias_union = set().union(*ALIAS.values())
+                score = len(nset & alias_union)
                 if score > best_score:
                     best_score = score
-                    best = (sheet, header_row, raw_cols)
-        # require at least 4 useful cols
-        if best is None or best_score < 4:         
-            raise ValueError("Could not find a sheet+header with expected columns. Please check the file.")
+                    best = (sheet, header_row)
 
-        sheet, header_row, raw_cols = best
-        utils.log(f"[clean] Auto-selected sheet='{sheet}' header_row={header_row} (score={best_score})")  
+                
+        if best is None:         
+            raise ValueError("No readable sheet found in workbook.")
+
+        sheet, header_row = best
+        utils.log(f"[clean] Fallback select sheet='{sheet}' header_row={header_row} (score={best_score})")  
 
         # read full sheet once (no usecols), then we’ll rename+select downstream
         df = xl.parse(sheet, header=header_row)      
@@ -218,6 +318,7 @@ def _coerce_time(df: pd.DataFrame) -> pd.DataFrame:
 # keep rows that look valid (or blank).
 def _quality_filters(df: pd.DataFrame) -> pd.DataFrame:
     """Conservative QC: numeric, non-negative; DO NOT drop on flags yet."""
+    df = df.copy() # avoids chained-assignment warnings
     before = len(df)
     df = df.dropna(subset=["value"])
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
@@ -290,20 +391,42 @@ def run() -> None:
     for p in paths:
         utils.log(f"[clean] Reading {p.name}")
         df = _read_any(p)
-        utils.log(f"[clean] After read: {len(df):,} rows | cols={list(df.columns)}")  
+        # after raw df is read, we decide schema and reshape to canonical long format
+        cols = {c.lower() for c in df.columns}
 
-        # Rename vendor columns to schema where present
-        df.columns = [c.strip() for c in df.columns]
-        rename = _build_rename_map(list(df.columns))
-        df = df.rename(columns=rename)
-        utils.log(f"[clean] Renamed → {rename}")  # helpful debug
+        is_2019_2020 = (
+            {"sample_point_id", "sp_name", "sample_datetime"}.issubset(cols)
+            and (
+                {"param_short_name"}.issubset(cols)
+                or {"param_id"}.issubset(cols)
+                or {"param_name"}.issubset(cols)
+            )
+        )
 
-        # Keep a consistent subset if columns exist
-        keep_candidates = ["timestamp_local", "timestamp_aest", "site_id", "site_name",
-                           "pollutant", "unit", "value", "validation_flag"]
-        keep = [c for c in keep_candidates if c in df.columns]
-        df = df[keep].copy()
-        utils.log(f"[clean] After rename/keep: {len(df):,} rows | keep={keep}")  
+        # a true 2021 "wide sheet" has site id/name + a local time column
+        # and does NOT already carry long-format columns like parameter_name/value
+        has_site_keys = {"location_id", "location_name"}.issubset(cols)
+        has_any_local = ({"datetime_local"} & cols) or ({"datetime_aest"} & cols)
+        is_long_alldata = {"parameter_name", "value"}.issubset(cols)
+
+        is_2021_wide = has_site_keys and bool(has_any_local) and not is_long_alldata
+
+        if is_2019_2020:
+            # 2019/2020 long schema
+            df = _reshape_2019_2020(df)
+
+        elif is_2021_wide:
+            # 2021 wide schema (sheet per site) - melt to long
+            df = _reshape_2021_wide(df)
+
+        else:
+            # 2022+ "AllData" style or already normalized: try alias rename and select
+            df.columns = [c.strip() for c in df.columns]
+            rename = _build_rename_map(list(df.columns))
+            df = df.rename(columns=rename)
+            keep = [c for c in ["timestamp_local", "timestamp_aest", "site_id", "site_name",
+                                "pollutant", "unit", "value", "validation_flag"] if c in df.columns]
+            df = df[keep].copy()
 
         df = _coerce_time(df)
         utils.log(f"[clean] After time coercion: {len(df):,} rows")  
