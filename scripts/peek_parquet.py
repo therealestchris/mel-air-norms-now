@@ -2,7 +2,7 @@
 import pandas as pd
 from pathlib import Path
 
-DF_PATH = Path("data/interim/daily.parquet")
+DF_PATH = Path("data/interim/hourly_uniform.parquet")
 
 def main():
     if not DF_PATH.exists():

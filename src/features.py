@@ -20,7 +20,7 @@ WHO_PM10_DAILY = 45.0
 
 def _require(path: Path) -> None:
     if not path.exists():
-        raise FileNotFoundError(f"{path} not found. Did you run `python main.py --step clean`?")
+        raise FileNotFoundError(f"{path} not found. Try running `python main.py --step clean`")
     
 def _auto_select_baseline_window(daily: pd.DataFrame,
                                  req_start: str,
