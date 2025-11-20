@@ -1,3 +1,5 @@
+# cli.py serves as a single command line interface that lets you run the entire processing pipeline
+
 import argparse
 from . import io_fetch, clean, features, compare, viz
 
